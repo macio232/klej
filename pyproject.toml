@@ -1,0 +1,67 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=77"]
+
+[project]
+name = "klej"
+description = "The missing glue between DVC and Slurm"
+authors = [
+  {name = "Maciej Falkiewicz"},
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "dawgz==2.7.0",
+    "dvc==3.66.0",
+    "pyyaml>=6.0",
+]
+dynamic = ["version"]
+keywords = ["workflow", "scheduling", "slurm", "hpc", "dvc"]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+readme = "README.md"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.16.6",
+]
+test = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+klej = "klej.__main__:main"
+
+[project.urls]
+Documentation = "https://github.com/macio232/klej#readme"
+Issues = "https://github.com/macio232/klej/issues"
+Source = "https://github.com/macio232/klej"
+
+[tool.ruff]
+line-length = 80
+
+[tool.ruff.lint]
+extend-select = ["ANN", "B", "I", "UP", "W"]
+ignore = ["ANN002", "ANN003", "ANN401"]
+preview = true
+
+[tool.ruff.lint.isort]
+lines-between-types = 1
+relative-imports-order = "closest-to-furthest"
+section-order = ["future", "third-party", "first-party", "local-folder"]
+
+[tool.ruff.format]
+preview = true
+
+[tool.setuptools.dynamic]
+version = {attr = "klej.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["klej*"]

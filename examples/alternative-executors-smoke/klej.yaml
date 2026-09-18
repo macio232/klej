@@ -1,0 +1,23 @@
+profiles:
+  candidate_a:
+    cpus: 1
+    mem: 128M
+    time: "00:02:00"
+  candidate_b:
+    cpus: 1
+    mem: 128M
+    time: "00:02:00"
+  control:
+    cpus: 1
+    mem: 128M
+    time: "00:02:00"
+
+stages:
+  success: [candidate_a, candidate_b]
+  failure: [candidate_a, candidate_b]
+
+commit: candidate_a
+klej: control
+
+# The wrapper records entry before executing the standalone klej runner.
+wrapper: [sh, wrapper.sh]

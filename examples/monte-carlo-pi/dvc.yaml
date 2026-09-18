@@ -1,0 +1,23 @@
+stages:
+  simulate:
+    foreach: [0, 1, 2, 3]
+    do:
+      cmd: python simulate.py ${item} outputs/sample-${item}.json
+      deps:
+        - simulate.py
+      outs:
+        - outputs/sample-${item}.json
+
+  estimate:
+    cmd: >-
+      python estimate.py outputs/pi.json
+      outputs/sample-0.json outputs/sample-1.json
+      outputs/sample-2.json outputs/sample-3.json
+    deps:
+      - estimate.py
+      - outputs/sample-0.json
+      - outputs/sample-1.json
+      - outputs/sample-2.json
+      - outputs/sample-3.json
+    outs:
+      - outputs/pi.json

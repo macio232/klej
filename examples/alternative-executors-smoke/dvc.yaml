@@ -1,0 +1,12 @@
+stages:
+  success:
+    cmd: python workload.py success
+    deps:
+      - workload.py
+    outs:
+      - outputs/success.json
+
+  failure:
+    cmd: python workload.py failure
+    deps:
+      - workload.py

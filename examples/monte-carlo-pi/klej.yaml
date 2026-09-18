@@ -1,0 +1,16 @@
+profiles:
+  simulation:
+    cpus: 1
+    ram: 128M
+    time: "00:01:00"
+  aggregation:
+    cpus: 1
+    ram: 128M
+    time: "00:01:00"
+
+stages:
+  simulate: simulation
+  estimate: aggregation
+
+commit: aggregation
+klej: aggregation
