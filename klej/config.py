@@ -1,6 +1,8 @@
+import configparser
 import os
 import re
 import shlex
+import uuid
 import yaml
 
 from copy import deepcopy
@@ -26,6 +28,7 @@ TOP_LEVEL_KEYS = {
     "environment",
     "wrapper",
 }
+KLEJ_CONFIG_KEYS = {"locking": {"mute_warning"}}
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,70 @@ class Config:
     klej: str
     environment: tuple[str, ...]
     wrapper: tuple[str, ...]
+
+
+def _read_klej_config(path: Path) -> configparser.ConfigParser:
+    config = configparser.ConfigParser(interpolation=None)
+    if path.exists():
+        try:
+            with path.open() as file:
+                config.read_file(file)
+        except (OSError, UnicodeError, configparser.Error) as error:
+            raise ValueError(
+                f"Invalid klej configuration at {path}: {error}"
+            ) from error
+    unknown_sections = set(config.sections()) - KLEJ_CONFIG_KEYS.keys()
+    if unknown_sections:
+        raise ValueError(
+            f"{path}: unknown sections: {', '.join(sorted(unknown_sections))}"
+        )
+    if config.defaults():
+        raise ValueError(f"{path}: default options are not supported")
+    for section, supported in KLEJ_CONFIG_KEYS.items():
+        if section not in config:
+            continue
+        unknown = set(config[section]) - supported
+        if unknown:
+            raise ValueError(
+                f"{path}: unknown {section} options: "
+                + ", ".join(sorted(unknown))
+            )
+    if config.has_option("locking", "mute_warning"):
+        try:
+            config.getboolean("locking", "mute_warning")
+        except ValueError as error:
+            raise ValueError(
+                f"{path}: locking.mute_warning must be a boolean"
+            ) from error
+    return config
+
+
+def locking_warning_muted(repo_root: Path) -> bool:
+    muted = False
+    root = repo_root / ".klej"
+    for name in ("config", "config.local"):
+        config = _read_klej_config(root / name)
+        if config.has_option("locking", "mute_warning"):
+            muted = config.getboolean("locking", "mute_warning")
+    return muted
+
+
+def mute_locking_warning(repo_root: Path, *, local: bool) -> Path:
+    root = repo_root / ".klej"
+    path = root / ("config.local" if local else "config")
+    config = _read_klej_config(path)
+    if "locking" not in config:
+        config.add_section("locking")
+    config.set("locking", "mute_warning", "true")
+    root.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w") as file:
+            config.write(file)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
 
 
 def _resolve(value: object, context: str) -> str | int | float | bool:

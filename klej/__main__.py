@@ -7,11 +7,22 @@ import re
 import subprocess
 import sys
 
+from datetime import datetime
+from dvc.config import Config as DvcConfig
+from dvc.config import to_bool
+from dvc.exceptions import DvcException
+from dvc.lock import Lock as DvcFileLock
 from dvc.repo import Repo
 from pathlib import Path
 from typing import Any
 
-from .config import Config, load_config, merge_config_files
+from .config import (
+    Config,
+    load_config,
+    locking_warning_muted,
+    merge_config_files,
+    mute_locking_warning,
+)
 from .runner import (
     cancel_slurm_jobs,
     clear_lock,
@@ -22,10 +33,12 @@ from .runner import (
 )
 from .runner_cache import install_runner
 from .status import (
+    _accounting_lower_bound,
     _is_cancellable,
     _slurm_states,
     clear_finished_workflows,
     clear_workflow,
+    print_inspection,
     print_logs,
     print_status,
 )
@@ -72,12 +85,42 @@ def _parser() -> argparse.ArgumentParser:
     cancel = commands.add_parser("cancel")
     cancel.add_argument("workflow_id")
     cancel.add_argument("--dry-run", action="store_true")
-    status = commands.add_parser("status")
+    status = commands.add_parser(
+        "status", help="list workflows by scheduler status"
+    )
     status_selection = status.add_mutually_exclusive_group()
-    status_selection.add_argument("workflow_id", nargs="?")
-    status_selection.add_argument("--failed", action="store_true")
-    status_selection.add_argument("--finished", action="store_true")
-    status.add_argument("--physical", action="store_true")
+    status_selection.add_argument(
+        "--failed", action="store_true", help="list failed terminal workflows"
+    )
+    status_selection.add_argument(
+        "--finished", action="store_true", help="list all terminal workflows"
+    )
+    status_selection.add_argument(
+        "--all", action="store_true", help="list all recorded workflows"
+    )
+    status_selection.add_argument(
+        "--all-after",
+        type=_status_datetime,
+        metavar="DATETIME",
+        help="list workflows submitted at or after DATETIME",
+    )
+    status_selection.add_argument(
+        "--fast",
+        action="store_true",
+        help="show active workflows using squeue only",
+    )
+    inspect = commands.add_parser(
+        "inspect", help="show detailed status for one workflow"
+    )
+    inspect.add_argument("workflow_id", help="workflow to inspect")
+    inspect.add_argument(
+        "--physical",
+        action="store_true",
+        help="also show every underlying Slurm job",
+    )
+    inspect.add_argument(
+        "--failed", action="store_true", help="only show failed jobs"
+    )
     logs = commands.add_parser("logs")
     logs.add_argument("workflow_id", nargs="?")
     logs.add_argument("job", nargs="?")
@@ -93,6 +136,12 @@ def _parser() -> argparse.ArgumentParser:
     clear = lock_commands.add_parser("clear")
     clear.add_argument("lock_id")
     clear.add_argument("--force", action="store_true")
+    setup_locking = commands.add_parser(
+        "setup-locking", help="configure DVC locking for shared filesystems"
+    )
+    setup_locking.add_argument("--local", action="store_true")
+    setup_locking.add_argument("--force", action="store_true")
+    setup_locking.add_argument("--mute", action="store_true")
     return parser
 
 
@@ -101,6 +150,17 @@ def _nonnegative_int(value: str) -> int:
     if number < 0:
         raise argparse.ArgumentTypeError("must be non-negative")
     return number
+
+
+def _status_datetime(value: str) -> datetime:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", value):
+        raise argparse.ArgumentTypeError("must use YYYY-MM-DDTHH:MM:SS")
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be a valid datetime in YYYY-MM-DDTHH:MM:SS format"
+        ) from error
 
 
 def _repo_root(start: Path) -> Path:
@@ -115,6 +175,130 @@ def _commit_mode(args: argparse.Namespace) -> str:
     if args.no_dvc_metadata:
         return "none"
     return "end"
+
+
+def _dvc_config(repo_root: Path) -> DvcConfig:
+    return DvcConfig(str(repo_root / ".dvc"))
+
+
+def _hardlink_lock_enabled(repo_root: Path) -> bool:
+    return bool(_dvc_config(repo_root)["core"].get("hardlink_lock", False))
+
+
+def _locking_warning(repo_root: Path) -> None:
+    if _hardlink_lock_enabled(repo_root) or locking_warning_muted(repo_root):
+        return
+    print(
+        "klej: warning: DVC core.hardlink_lock is disabled. Concurrent "
+        "jobs on shared filesystems may corrupt DVC lock metadata. Run "
+        "`klej setup-locking`, use `--local` for checkout-only DVC "
+        "configuration, or use `--mute` to acknowledge this warning.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _rwlock_is_idle(path: Path) -> bool:
+    if not path.exists():
+        return True
+    try:
+        document = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"DVC lock metadata is malformed at {path}"
+        ) from error
+    if not isinstance(document, dict):
+        raise TypeError(f"DVC lock metadata is malformed at {path}")
+    return not document.get("read") and not document.get("write")
+
+
+def _check_legacy_guards(dvc_tmp: Path) -> None:
+    acquired: list[DvcFileLock] = []
+    try:
+        for name in ("lock", "rwlock.lock", "updater.lock"):
+            path = dvc_tmp / name
+            if not path.exists():
+                continue
+            if path.stat().st_nlink != 1:
+                raise RuntimeError(
+                    f"DVC lock guard is active or ambiguous: {path}"
+                )
+            lock = DvcFileLock(str(path))
+            try:
+                lock.lock()
+            except DvcException as error:
+                raise RuntimeError(
+                    f"DVC lock guard is active: {path}"
+                ) from error
+            acquired.append(lock)
+        if not _rwlock_is_idle(dvc_tmp / "rwlock"):
+            raise RuntimeError(
+                "DVC rwlock contains active readers or writers; stop DVC "
+                "and klej processes before configuring locking"
+            )
+    finally:
+        for lock in reversed(acquired):
+            lock.unlock()
+
+
+def _setup_locking(
+    invocation_root: Path, *, local: bool, force: bool, mute: bool
+) -> None:
+    repo_root = _repo_root(invocation_root)
+    if mute:
+        if force:
+            raise ValueError("--mute cannot be combined with --force")
+        path = mute_locking_warning(repo_root, local=local)
+        print(f"Muted DVC locking warning in {path.relative_to(repo_root)}.")
+        return
+    config = _dvc_config(repo_root)
+    if not local:
+        local_core = config.load_one("local").get("core", {})
+        if "hardlink_lock" in local_core and not to_bool(
+            local_core["hardlink_lock"]
+        ):
+            raise RuntimeError(
+                ".dvc/config.local overrides core.hardlink_lock=false; "
+                "rerun with --local or remove the local override"
+            )
+    if force:
+        print(
+            "klej: warning: forced lock migration may disrupt active DVC "
+            "or Slurm work",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        roots = {invocation_root, repo_root}
+        active = {}
+        for root in roots:
+            documents = lock_documents(root)
+            if documents:
+                active[str(root)] = sorted(documents)
+        if active:
+            raise RuntimeError(
+                "active klej locks prevent DVC lock migration: "
+                + json.dumps(active, sort_keys=True)
+            )
+        _check_legacy_guards(repo_root / ".dvc" / "tmp")
+
+    level = "local" if local else "repo"
+    with config.edit(level) as target:
+        target.setdefault("core", {})["hardlink_lock"] = "true"
+
+    dvc_tmp = repo_root / ".dvc" / "tmp"
+    for name in ("lock", "rwlock.lock", "updater.lock"):
+        (dvc_tmp / name).unlink(missing_ok=True)
+
+    try:
+        with Repo(str(repo_root)) as repo, repo.lock:
+            pass
+    except DvcException as error:
+        raise RuntimeError(
+            "DVC hardlink locking was configured, but verification failed"
+        ) from error
+    relative = ".dvc/config.local" if local else ".dvc/config"
+    print(f"Configured DVC hardlink locking in {relative}.")
 
 
 def _target_path(target: str, invocation_root: Path) -> Path:
@@ -198,6 +382,8 @@ def _repro(args: argparse.Namespace, invocation_root: Path) -> None:
         else _target_path(raw_targets[0], invocation_root)
     )
     repo_root = _repo_root(start)
+    if args.backend == "slurm":
+        _locking_warning(repo_root)
     targets = [
         _normalize_target(target, invocation_root, repo_root)
         for target in raw_targets
@@ -362,6 +548,8 @@ def _repro(args: argparse.Namespace, invocation_root: Path) -> None:
         )
         document["reservation_id"] = reservation[0]
         document["execution_root"] = str(invocation_root)
+        if args.backend == "slurm":
+            document["accounting_start"] = scheduler.date.isoformat()
         document["submission_state"] = "planned"
         update_plan_jobs(document, leaves)
         write_plan(scheduler.path / "plan.json", document)
@@ -495,7 +683,13 @@ def _cancel(workflow_id: str, dry_run: bool) -> None:
     ]
     if invalid:
         raise ValueError(f"Invalid Slurm job IDs in workflow plan: {invalid}")
-    states = _slurm_states(job_ids)
+    recorded_date = getattr(scheduler, "date", None)
+    accounting_start = (
+        _accounting_lower_bound(recorded_date)
+        if isinstance(recorded_date, datetime)
+        else None
+    )
+    states = _slurm_states(job_ids, accounting_start)
     cancellable = [
         job_id for job_id in job_ids if _is_cancellable(states.get(job_id))
     ]
@@ -526,13 +720,28 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "status":
             print_status(
                 dawgz.get_dawgz_dir(),
-                args.workflow_id,
                 args.failed,
                 args.finished,
+                args.fast,
+                args.all,
+                args.all_after,
+            )
+        elif args.command == "inspect":
+            print_inspection(
+                dawgz.get_dawgz_dir(),
+                args.workflow_id,
                 args.physical,
+                args.failed,
             )
         elif args.command == "logs":
             _logs(args, dawgz.get_dawgz_dir())
+        elif args.command == "setup-locking":
+            _setup_locking(
+                invocation_root,
+                local=args.local,
+                force=args.force,
+                mute=args.mute,
+            )
         else:
             if args.lock_command == "status":
                 documents = lock_documents(invocation_root)

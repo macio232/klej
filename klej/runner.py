@@ -176,17 +176,6 @@ def _force_remove(path: Path) -> None:
     path.rmdir()
 
 
-def validate_dvc_lock(repo_root: Path) -> None:
-    path = repo_root / ".dvc" / "tmp" / "rwlock"
-    if path.exists():
-        try:
-            json.loads(path.read_text())
-        except json.JSONDecodeError as error:
-            raise RuntimeError(
-                f"DVC lock metadata is corrupted at {path}"
-            ) from error
-
-
 @contextmanager
 def commit_lock(repo_root: Path, target: str) -> Iterator[None]:
     root = state_root(repo_root)
@@ -211,7 +200,6 @@ def commit_lock(repo_root: Path, target: str) -> Iterator[None]:
         for signum in (signal.SIGINT, signal.SIGTERM):
             handlers[signum] = signal.signal(signum, interrupt)
     try:
-        validate_dvc_lock(repo_root)
         yield
     finally:
         for signum, handler in handlers.items():
@@ -593,7 +581,7 @@ def run_stage(
     try:
         _verbose(f"loading DVC target {target}", verbose)
         with commit_lock(execution_root, f"read:{target}"):
-            repo = Repo(str(repo_root))
+            repo = Repo(str(repo_root), _wait_for_lock=True)
             stages = repo.stage.collect(absolute_target(repo_root, target))
         if verbose:
             _enable_verbose_logging()
@@ -671,7 +659,7 @@ def commit_targets(
                     check=True,
                 )
         else:
-            with Repo(str(repo_root)) as repo, repo.lock:
+            with Repo(str(repo_root), _wait_for_lock=True) as repo, repo.lock:
                 for target in targets:
                     stages = repo.stage.collect(
                         absolute_target(repo_root, target)

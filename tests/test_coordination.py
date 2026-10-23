@@ -478,3 +478,14 @@ def test_commit_lock_excludes_a_second_thread(
     assert errors == []
     assert entered.is_set()
     assert lock_documents(tmp_path) == {}
+
+
+def test_commit_lock_does_not_read_dvc_rwlock(tmp_path: Path) -> None:
+    rwlock = tmp_path / ".dvc" / "tmp" / "rwlock"
+    rwlock.parent.mkdir(parents=True)
+    rwlock.write_text("")
+
+    with commit_lock(tmp_path, "stage"):
+        pass
+
+    assert lock_documents(tmp_path) == {}

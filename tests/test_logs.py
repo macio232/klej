@@ -46,10 +46,7 @@ def _alternative_record(
     winner: dict[str, object] | None = None,
     execution_root: Path | None = None,
     accounting: str = (
-        "10|COMPLETED||0:0\n"
-        "11|FAILED||75:0\n"
-        "12|COMPLETED||0:0\n"
-        "13|COMPLETED||0:0\n"
+        "10|COMPLETED|0:0\n11|FAILED|75:0\n12|COMPLETED|0:0\n13|COMPLETED|0:0\n"
     ),
     separate_commit: bool = False,
 ) -> tuple[Path, str]:
@@ -164,7 +161,9 @@ def test_follow_emits_appended_content_and_stops_at_terminal_state(
     log = path / "0001_second.log"
     log.write_text("existing\n")
     states = iter(("running", "succeeded"))
-    monkeypatch.setattr("klej.status._refresh", lambda _job: next(states))
+    monkeypatch.setattr(
+        "klej.status._refresh", lambda _job, _start: next(states)
+    )
     monkeypatch.setattr(
         "klej.status.time.sleep",
         lambda _interval: log.open("a").write("appended\n"),
@@ -183,7 +182,9 @@ def test_follow_waits_once_for_delayed_log_creation(
     path = _record(tmp_path, monkeypatch)
     log = path / "0001_second.log"
     states = iter(("running", "succeeded"))
-    monkeypatch.setattr("klej.status._refresh", lambda _job: next(states))
+    monkeypatch.setattr(
+        "klej.status._refresh", lambda _job, _start: next(states)
+    )
     monkeypatch.setattr(
         "klej.status.time.sleep",
         lambda _interval: log.write_text("late\n"),
@@ -288,7 +289,7 @@ def test_logs_rejects_terminal_job_without_log_or_trace(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _record(tmp_path, monkeypatch)
-    monkeypatch.setattr("klej.status._refresh", lambda _job: "failed")
+    monkeypatch.setattr("klej.status._refresh", lambda _job, _start: "failed")
 
     with pytest.raises(SystemExit):
         main(["logs", "workflow", "1"])
@@ -354,11 +355,11 @@ def test_logs_logical_alternative_with_separate_commit_is_unambiguous(
         monkeypatch,
         {"claiming_job_id": "10", "outcome": "succeeded"},
         accounting=(
-            "10|COMPLETED||0:0\n"
-            "11|FAILED||75:0\n"
-            "12|COMPLETED||0:0\n"
-            "13|COMPLETED||0:0\n"
-            "14|COMPLETED||0:0\n"
+            "10|COMPLETED|0:0\n"
+            "11|FAILED|75:0\n"
+            "12|COMPLETED|0:0\n"
+            "13|COMPLETED|0:0\n"
+            "14|COMPLETED|0:0\n"
         ),
         separate_commit=True,
     )
@@ -419,8 +420,8 @@ def test_logs_exact_slurm_id_takes_precedence_over_logical_index(
             command,
             0,
             stdout=(
-                "0|FAILED||75:0\n11|COMPLETED||0:0\n"
-                "12|COMPLETED||0:0\n13|COMPLETED||0:0\n"
+                "0|FAILED|75:0\n11|COMPLETED|0:0\n"
+                "12|COMPLETED|0:0\n13|COMPLETED|0:0\n"
             ),
         ),
     )
@@ -439,7 +440,7 @@ def test_logs_unresolved_alternative_lists_attempts_without_using_logs(
     path, _ = _alternative_record(
         tmp_path,
         monkeypatch,
-        accounting="10|PENDING||\n11|RUNNING||\n12|PENDING||\n13|PENDING||\n",
+        accounting="10|PENDING|\n11|RUNNING|\n12|PENDING|\n13|PENDING|\n",
     )
     (path / "0001_large_attempt.log").write_text("first log\n")
 
@@ -461,8 +462,8 @@ def test_follow_rejects_terminal_canceled_race_without_waiting(
         tmp_path,
         monkeypatch,
         accounting=(
-            "10|CANCELLED||0:0\n11|CANCELLED||0:0\n"
-            "12|CANCELLED||0:0\n13|COMPLETED||0:0\n"
+            "10|CANCELLED|0:0\n11|CANCELLED|0:0\n"
+            "12|CANCELLED|0:0\n13|COMPLETED|0:0\n"
         ),
     )
     monkeypatch.setattr(
@@ -541,7 +542,9 @@ def test_follow_waits_for_unknown_attempt_present_in_queue(
 
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr("klej.status.time.sleep", resolve)
-    monkeypatch.setattr("klej.status._refresh", lambda _job: "succeeded")
+    monkeypatch.setattr(
+        "klej.status._refresh", lambda _job, _start: "succeeded"
+    )
 
     main(["logs", "alternatives", "dvc.yaml:train", "--follow"])
 
@@ -661,8 +664,8 @@ def test_logs_infers_only_one_successful_attempt(
             command,
             0,
             stdout=(
-                "10|COMPLETED||0:0\n11|COMPLETED||0:0\n"
-                "12|COMPLETED||0:0\n13|COMPLETED||0:0\n"
+                "10|COMPLETED|0:0\n11|COMPLETED|0:0\n"
+                "12|COMPLETED|0:0\n13|COMPLETED|0:0\n"
             ),
         ),
     )
@@ -679,7 +682,7 @@ def test_follow_waits_for_winner_then_follows_its_log(
     path, logical_id = _alternative_record(
         tmp_path,
         monkeypatch,
-        accounting="10|RUNNING||\n11|PENDING||\n12|PENDING||\n13|PENDING||\n",
+        accounting="10|RUNNING|\n11|PENDING|\n12|PENDING|\n13|PENDING|\n",
     )
     log = path / "0000_small_attempt.log"
 
@@ -692,7 +695,9 @@ def test_follow_waits_for_winner_then_follows_its_log(
         log.write_text("winner\n")
 
     monkeypatch.setattr("klej.status.time.sleep", resolve)
-    monkeypatch.setattr("klej.status._refresh", lambda _job: "succeeded")
+    monkeypatch.setattr(
+        "klej.status._refresh", lambda _job, _start: "succeeded"
+    )
 
     main(["logs", "alternatives", "dvc.yaml:train", "--follow"])
 

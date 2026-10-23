@@ -61,10 +61,16 @@ klej repro path/to/dvc.yaml
 klej repro [targets ...]
 klej repro models/dvc.yaml:train --downstream
 klej repro pipelines/ -R
+klej setup-locking
+klej setup-locking --mute
 klej status
-klej status WORKFLOW_ID
+klej status --fast
 klej status --failed
 klej status --finished
+klej status --all
+klej status --all-after 2026-09-22T12:30:00
+klej inspect WORKFLOW_ID
+klej inspect WORKFLOW_ID --physical
 klej logs WORKFLOW_ID JOB --tail 100 --follow
 klej logs --clear WORKFLOW_ID
 klej logs --clear-all --force
@@ -228,10 +234,92 @@ invoke `dvc commit --force`.
 
 klej installs an immutable, standalone compute runner under `.klej/runners/`
 in the directory where the command is run and keeps shared coordination data
-under `.klej/locks/` there. Add `.klej/` to the consumer repository's ignore
-rules. The repository must be visible at the same path to submission and
-compute nodes. Containers need Python and the pinned DVC version, but do not
-need klej installed.
+under `.klej/locks/` there. Ignore klej runtime state as described below. The
+repository must be visible at the same path to submission and compute nodes.
+Containers need Python and the pinned DVC version, but do not need klej
+installed.
+
+### klej configuration files
+
+`.klej/config` and `.klej/config.local` are DVC-style INI files for klej
+settings that are not part of pipeline scheduling configuration. They are
+separate from both `klej.yaml` and DVC's `.dvc/config` files. klej resolves
+them from the DVC repository root regardless of the directory where the
+command is invoked.
+
+`.klej/config` contains repository-wide settings and is intended to be tracked
+and shared with collaborators. `.klej/config.local` contains checkout-specific
+settings, is ignored by Git, and overrides matching values from
+`.klej/config`.
+
+The currently supported setting is:
+
+```ini
+[locking]
+mute_warning = true
+```
+
+`locking.mute_warning` suppresses klej's warning about using DVC's default
+locking with the Slurm backend. It does not change DVC configuration, select a
+different lock implementation, or modify any lock files. A checkout can
+restore a warning muted by the tracked project configuration with:
+
+```ini
+# .klej/config.local
+[locking]
+mute_warning = false
+```
+
+Track the shared configuration while ignoring local configuration and runtime
+state:
+
+```gitignore
+/.klej/*
+!/.klej/config
+```
+
+### DVC locking on shared filesystems
+
+DVC's default file locks may not coordinate reliably across nodes on some
+shared filesystems. `klej repro` warns when the Slurm backend is used without
+DVC hardlink locking, but does not prevent submission because filesystem lock
+behavior depends on the cluster.
+
+Configure hardlink locking for the repository with:
+
+```console
+klej setup-locking
+```
+
+This writes `core.hardlink_lock=true` to `.dvc/config`. Use
+`klej setup-locking --local` to write the setting to the Git-ignored
+`.dvc/config.local` instead. All processes using one working tree must use the
+same lock backend; do not switch between the default and hardlink backends for
+local and Slurm commands.
+
+If the shared filesystem supports DVC's default locks, acknowledge the risk and
+mute the Slurm warning without changing DVC configuration or lock files:
+
+```console
+klej setup-locking --mute
+```
+
+This writes `locking.mute_warning=true` to `.klej/config`. Add `--local` to
+write `.klej/config.local` instead. See the klej configuration section above
+for file scope and precedence. `--mute` cannot be combined with `--force`.
+
+Run setup only while no DVC commands or klej workflows are active. The command
+checks known klej coordination state and DVC lock metadata, updates the chosen
+configuration, removes legacy `.dvc/tmp/lock`, `.dvc/tmp/rwlock.lock`, and
+`.dvc/tmp/updater.lock` guard files, and verifies the new lock. It never removes
+`.dvc/tmp/rwlock`. `--force` bypasses the activity checks and can disrupt
+active work.
+
+Fresh clones that receive the project setting in `.dvc/config` need no lock
+migration. Existing working trees that pull the setting may retain guard files
+from the default backend and should run `klej setup-locking` once while idle.
+An abruptly terminated hardlink-locked process can leave a stale guard; inspect
+active DVC and Slurm processes before forcing cleanup.
 
 ## Wrapper examples
 
@@ -328,12 +416,19 @@ example is an independent DVC repository with its own `dvc.yaml` and
 ## Workflow status
 
 `klej status` lists active Slurm workflows recorded in the current `.dawgz`
-directory. A workflow is active while any job is pending or running. The
-summary shows the workflow ID, DVC pipeline, and counts of pending, running,
-succeeded, failed, cancelled, and unknown jobs. Counts include compute,
-commit, and reservation-cleanup jobs. Local-backend workflows are omitted.
+directory. A workflow is active while any recorded job is present in
+`squeue`. Klej uses that queue snapshot to select active workflows, then
+queries `sacct` for their pending, running, succeeded, failed, cancelled, and
+unknown counts. Workflows absent from `squeue` and local-backend workflows are
+omitted. Counts include compute, commit, and reservation-cleanup jobs, with
+alternative-profile attempts folded into one logical stage.
 
-`klej status WORKFLOW_ID` prints the aggregate state and every DAWGZ job in
+`klej status --fast` skips accounting and reports total logical jobs, pending
+jobs, running jobs, and jobs no longer present in the queue. `NOT_IN_QUEUE`
+does not distinguish successful, failed, or cancelled jobs. The fast option
+cannot be combined with `--failed` or `--finished`.
+
+`klej inspect WORKFLOW_ID` prints the aggregate state and every DAWGZ job in
 stable zero-based order. It deliberately does not truncate or page large
 foreach or matrix workflows. New compute jobs are identified by their exact
 expanded DVC target, such as `dvc.yaml:simulate@0`; internal jobs retain their
@@ -343,12 +438,17 @@ unmodified accounting start date-time, or `-` when it is unavailable. Rows
 with known start times are ordered from oldest to newest; missing start times
 appear last in stable DAWGZ order.
 
+`klej inspect WORKFLOW_ID --failed` shows only jobs whose normalized state is
+`failed`. Workflow state, terminality, and counts still describe the complete
+workflow. When combined with `--physical`, the filter also applies to the
+underlying jobs; attempts displayed as `superseded` are omitted.
+
 For alternative resource profiles, status shows one logical row and summary
 count per stage. The winning attempt and success gate determine that row;
 losing attempts do not count as failed workloads. Cancelling a claimed stage
 is reported as cancelled unless its payload failure was already recorded or
 the claimant failed in Slurm. Use
-`klej status WORKFLOW_ID --physical` to append every attempt, gate, commit, and
+`klej inspect WORKFLOW_ID --physical` to append every attempt, gate, commit, and
 cleanup job with its raw Slurm state and exit code. Losing siblings appear as
 `superseded`. Workflow terminality and safe record clearing still account for
 all physical jobs, including rows hidden from the default logical view.
@@ -357,14 +457,37 @@ all physical jobs, including rows hidden from the default logical view.
 failed or cancelled job. A workflow containing an unknown job is not known to
 be terminal. Slurm accounting has a cluster-defined retention window: once a
 job disappears from `sacct`, klej reports it as unknown, so sufficiently old
-failed workflows may no longer appear in this listing.
+failed workflows may no longer appear in this listing. Unlike the default
+view, this command queries accounting for every recorded Slurm workflow.
 
 `klej status --finished` lists every recorded workflow known to be terminal,
 including local-backend records, with an aggregate status of `succeeded`,
 `failed`, or `cancelled`. Its `SUBMISSION` column contains the DAWGZ workflow
 submission date-time, and rows are ordered from oldest to newest. Legacy
 records without that timestamp show `-` after timestamped workflows. Pending,
-running, and unknown workflows are omitted.
+running, and unknown workflows are omitted. This command queries accounting
+for every recorded Slurm workflow.
+
+`klej status --all` lists every recorded Slurm and local workflow, including
+active, terminal, and unknown workflows. It shows the workflow submission
+date-time, aggregate status, and pending, running, succeeded, failed,
+cancelled, and unknown job counts. Rows with known submission times are
+ordered from oldest to newest; legacy records without a timestamp show `-`
+after them.
+
+`klej status --all-after DATETIME` shows the same table, limited to workflows
+submitted at or after `DATETIME`. The value must use the exact
+`YYYY-MM-DDTHH:MM:SS` format, for example `2026-09-22T12:30:00`. Legacy
+records without a submission timestamp remain included because their age
+cannot be determined.
+
+The `--failed`, `--finished`, `--all`, `--all-after`, and `--fast` modes are
+mutually exclusive.
+
+Accounting-backed commands restrict `sacct` to the recorded workflow time
+range, with a five-minute margin for clock skew. Older records without a plan
+timestamp use the DAWGZ submission timestamp when available and otherwise
+fall back to an unbounded accounting query.
 
 Slurm states are normalized to pending, running, succeeded, failed, cancelled,
 or unknown while the complete scheduler value remains visible in detailed

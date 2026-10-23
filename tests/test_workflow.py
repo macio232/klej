@@ -5,6 +5,7 @@ import pytest
 import subprocess
 import sys
 
+from datetime import datetime
 from dvc.repo import Repo
 from pathlib import Path
 
@@ -928,6 +929,7 @@ def test_mocked_slurm_submission_registers_alternative_race_before_release(
     main(["repro", "train", "--force"])
 
     assert release_snapshot
+    datetime.fromisoformat(release_snapshot["document"]["accounting_start"])
     assert len(scripts) == 5
     assert not any("#SBATCH --array" in script for script in scripts)
     attempt_scripts = [script for script in scripts if "_attempt_" in script]

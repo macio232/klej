@@ -11,7 +11,7 @@ import time
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +58,22 @@ _CATEGORIES = (
     "unknown",
 )
 _SUMMARY_COLUMNS = ("WORKFLOW", "PIPELINE", *map(str.upper, _CATEGORIES))
-_SACCT_BATCH_SIZE = 1_000
+_ALL_SUMMARY_COLUMNS = (
+    "WORKFLOW",
+    "PIPELINE",
+    "SUBMISSION",
+    "STATUS",
+    *map(str.upper, _CATEGORIES),
+)
+_QUEUE_SUMMARY_COLUMNS = (
+    "WORKFLOW",
+    "PIPELINE",
+    "TOTAL",
+    "PENDING",
+    "RUNNING",
+    "NOT_IN_QUEUE",
+)
+_SLURM_BATCH_SIZE = 1_000
 _FOLLOW_INTERVAL = 1.0
 _PHYSICAL_ROLES = {"stage", "attempt", "gate", "commit", "cleanup", "internal"}
 
@@ -75,6 +90,7 @@ class _Plan:
     physical_jobs: tuple[dict[str, Any], ...] = ()
     reservation_id: str | None = None
     execution_root: Path | None = None
+    accounting_start: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -163,12 +179,25 @@ def _read_plan(path: Path) -> _Plan:
     physical = document.get("physical_jobs")
     reservation_id = document.get("reservation_id")
     execution_root = document.get("execution_root")
+    accounting_start = document.get("accounting_start")
     if not isinstance(stages, list) or not isinstance(physical, list):
         raise TypeError(f"Malformed version 2 klej workflow plan: {path}")
     if reservation_id is not None and not isinstance(reservation_id, str):
         raise TypeError(f"Malformed version 2 klej workflow plan: {path}")
     if execution_root is not None and not isinstance(execution_root, str):
         raise TypeError(f"Malformed version 2 klej workflow plan: {path}")
+    if accounting_start is not None and not isinstance(accounting_start, str):
+        raise TypeError(f"Malformed version 2 klej workflow plan: {path}")
+    try:
+        parsed_accounting_start = (
+            datetime.fromisoformat(accounting_start)
+            if accounting_start is not None
+            else None
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"Malformed accounting start time in klej workflow plan: {path}"
+        ) from error
     if not all(
         isinstance(stage, dict)
         and isinstance(stage.get("id"), str)
@@ -213,6 +242,7 @@ def _read_plan(path: Path) -> _Plan:
         tuple(physical),
         reservation_id,
         Path(execution_root) if execution_root is not None else None,
+        parsed_accounting_start,
     )
 
 
@@ -230,12 +260,14 @@ def _plan(root: Path, workflow_id: str) -> _Plan:
 
 
 def _slurm_accounting(
-    job_ids: list[str], fields: tuple[str, ...]
+    job_ids: list[str],
+    fields: tuple[str, ...],
+    accounting_start: datetime | None = None,
 ) -> dict[str, tuple[str, ...]]:
     records = {}
     unique = list(dict.fromkeys(job_ids))
-    for offset in range(0, len(unique), _SACCT_BATCH_SIZE):
-        batch = unique[offset : offset + _SACCT_BATCH_SIZE]
+    for offset in range(0, len(unique), _SLURM_BATCH_SIZE):
+        batch = unique[offset : offset + _SLURM_BATCH_SIZE]
         command = [
             "sacct",
             "-j",
@@ -246,6 +278,8 @@ def _slurm_accounting(
             "-P",
             "-X",
         ]
+        if accounting_start is not None:
+            command.extend(("--starttime", accounting_start.isoformat()))
         try:
             output = subprocess.run(
                 command, capture_output=True, check=True, text=True
@@ -268,24 +302,48 @@ def _slurm_accounting(
     return records
 
 
-def _slurm_states(job_ids: list[str]) -> dict[str, str]:
+def _slurm_states(
+    job_ids: list[str], accounting_start: datetime | None = None
+) -> dict[str, str]:
     return {
         job_id: values[0]
-        for job_id, values in _slurm_accounting(job_ids, ("State",)).items()
+        for job_id, values in _slurm_accounting(
+            job_ids, ("State",), accounting_start
+        ).items()
     }
 
 
 def _slurm_queue(job_ids: list[str]) -> set[str]:
     unique = list(dict.fromkeys(job_ids))
-    if not unique:
-        return set()
-    command = [
-        "squeue",
-        "--noheader",
-        "--jobs",
-        ",".join(unique),
-        "--format=%A",
-    ]
+    queued = set()
+    for offset in range(0, len(unique), _SLURM_BATCH_SIZE):
+        batch = unique[offset : offset + _SLURM_BATCH_SIZE]
+        command = [
+            "squeue",
+            "--noheader",
+            "--jobs",
+            ",".join(batch),
+            "--format=%A",
+        ]
+        try:
+            output = subprocess.run(
+                command, capture_output=True, check=True, text=True
+            ).stdout
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                "Cannot query Slurm queue: squeue was not found"
+            ) from error
+        except subprocess.CalledProcessError as error:
+            detail = error.stderr.strip() if error.stderr else str(error)
+            raise RuntimeError(f"Cannot query Slurm queue: {detail}") from error
+        queued.update(
+            line.strip() for line in output.splitlines() if line.strip()
+        )
+    return queued
+
+
+def _slurm_user_states() -> dict[str, str]:
+    command = ["squeue", "--noheader", "--me", "--format=%A|%T"]
     try:
         output = subprocess.run(
             command, capture_output=True, check=True, text=True
@@ -297,13 +355,21 @@ def _slurm_queue(job_ids: list[str]) -> set[str]:
     except subprocess.CalledProcessError as error:
         detail = error.stderr.strip() if error.stderr else str(error)
         raise RuntimeError(f"Cannot query Slurm queue: {detail}") from error
-    return {line.strip() for line in output.splitlines() if line.strip()}
+    states = {}
+    for line in output.splitlines():
+        job_id, separator, state = line.partition("|")
+        if separator and job_id:
+            states[job_id] = state
+    return states
 
 
 def _slurm_details(
     job_ids: list[str],
+    accounting_start: datetime | None = None,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
-    records = _slurm_accounting(job_ids, ("State", "Start", "ExitCode"))
+    records = _slurm_accounting(
+        job_ids, ("State", "Start", "ExitCode"), accounting_start
+    )
     states = {job_id: values[0] for job_id, values in records.items()}
     start_times = {
         job_id: values[1] for job_id, values in records.items() if values[1]
@@ -312,6 +378,19 @@ def _slurm_details(
         job_id: values[2] for job_id, values in records.items() if values[2]
     }
     return states, start_times, exit_codes
+
+
+def _slurm_statuses(
+    job_ids: list[str], accounting_start: datetime | None = None
+) -> tuple[dict[str, str], dict[str, str]]:
+    records = _slurm_accounting(
+        job_ids, ("State", "ExitCode"), accounting_start
+    )
+    states = {job_id: values[0] for job_id, values in records.items()}
+    exit_codes = {
+        job_id: values[1] for job_id, values in records.items() if values[1]
+    }
+    return states, exit_codes
 
 
 def _normalized_state(state: str | None) -> str:
@@ -366,13 +445,38 @@ def _load_scheduler(plan: _Plan) -> Any | None:
         ) from error
 
 
+def _accounting_lower_bound(value: datetime) -> datetime:
+    return value - timedelta(minutes=5)
+
+
+def _plan_accounting_start(plan: _Plan) -> datetime | None:
+    if plan.accounting_start is not None:
+        return _accounting_lower_bound(plan.accounting_start)
+    scheduler = _load_scheduler(plan)
+    recorded = getattr(scheduler, "date", None)
+    return (
+        _accounting_lower_bound(recorded)
+        if isinstance(recorded, datetime)
+        else None
+    )
+
+
+def _plans_accounting_start(plans: list[_Plan]) -> datetime | None:
+    slurm_plans = [plan for plan in plans if plan.backend == "slurm"]
+    starts = [_plan_accounting_start(plan) for plan in slurm_plans]
+    if not starts or any(start is None for start in starts):
+        return None
+    return min(start for start in starts if start is not None)
+
+
 def _load_physical_jobs(
     plan: _Plan,
     states: dict[str, str],
     start_times: dict[str, str],
     exit_codes: dict[str, str],
+    load_scheduler: bool = True,
 ) -> tuple[tuple[_JobStatus, ...], datetime | None]:
-    scheduler = _load_scheduler(plan)
+    scheduler = _load_scheduler(plan) if load_scheduler else None
     cleanup_failure = _cleanup_failure_detail(plan)
     by_id = {}
     by_name: dict[str, list[tuple[Any, int]]] = {}
@@ -751,13 +855,20 @@ def _workflow(
     states: dict[str, str],
     start_times: dict[str, str] | None = None,
     exit_codes: dict[str, str] | None = None,
+    load_scheduler: bool = True,
 ) -> _WorkflowStatus:
-    jobs, submission = _load_jobs(plan, states, start_times, exit_codes)
-    physical = None
     if plan.version == 2:
-        physical, _ = _load_physical_jobs(
-            plan, states, start_times or {}, exit_codes or {}
+        physical, submission = _load_physical_jobs(
+            plan,
+            states,
+            start_times or {},
+            exit_codes or {},
+            load_scheduler,
         )
+        jobs = _logical_jobs(plan, physical)
+    else:
+        jobs, submission = _load_jobs(plan, states, start_times, exit_codes)
+        physical = None
     return _WorkflowStatus(plan, jobs, submission, physical)
 
 
@@ -776,47 +887,88 @@ def _format_table(columns: tuple[str, ...], rows: list[tuple[Any, ...]]) -> str:
     ).rstrip()
 
 
-def _workflows(plans: list[_Plan]) -> list[_WorkflowStatus]:
+def _plan_job_ids(plan: _Plan) -> list[str]:
+    if plan.version == 2:
+        return [
+            str(job["slurm_job_id"])
+            for job in plan.physical_jobs
+            if job.get("slurm_job_id")
+        ]
+    return list(plan.jobs)
+
+
+def _workflows(
+    plans: list[_Plan], load_submitted_dumps: bool = True
+) -> list[_WorkflowStatus]:
     job_ids = [
         job_id
         for plan in plans
         if plan.backend == "slurm"
-        for job_id in (
-            [
-                str(job["slurm_job_id"])
-                for job in plan.physical_jobs
-                if job.get("slurm_job_id")
-            ]
-            if plan.version == 2
-            else list(plan.jobs)
-        )
+        for job_id in _plan_job_ids(plan)
     ]
-    records = _slurm_accounting(job_ids, ("State", "Start", "ExitCode"))
-    states = {job_id: values[0] for job_id, values in records.items()}
-    starts = {
-        job_id: values[1] for job_id, values in records.items() if values[1]
-    }
-    exits = {
-        job_id: values[2] for job_id, values in records.items() if values[2]
-    }
-    return [_workflow(plan, states, starts, exits) for plan in plans]
+    states, exits = _slurm_statuses(job_ids, _plans_accounting_start(plans))
+    return [
+        _workflow(
+            plan,
+            states,
+            {},
+            exits,
+            load_scheduler=(
+                load_submitted_dumps
+                or any(
+                    job.get("slurm_job_id") is None
+                    for job in plan.physical_jobs
+                )
+            ),
+        )
+        for plan in plans
+    ]
 
 
 def _all_workflows(
-    root: Path, include_local: bool = False
+    root: Path,
+    include_local: bool = False,
+    load_submitted_dumps: bool = True,
 ) -> list[_WorkflowStatus]:
     plans = [
         plan
         for plan in _plans(root)
         if plan.backend == "slurm" or include_local and plan.backend == "local"
     ]
-    return _workflows(plans)
+    return _workflows(plans, load_submitted_dumps)
 
 
-def _print_summary(root: Path, failed: bool, finished: bool) -> None:
+def _print_summary(
+    root: Path,
+    failed: bool,
+    finished: bool,
+    fast: bool,
+    show_all: bool,
+    all_after: datetime | None,
+) -> None:
     rows = []
-    workflows = _all_workflows(root, include_local=finished)
-    if finished:
+    comprehensive = show_all or all_after is not None
+    if not failed and not finished and not comprehensive:
+        plans = [plan for plan in _plans(root) if plan.backend == "slurm"]
+        has_jobs = any(_plan_job_ids(plan) for plan in plans)
+        states = _slurm_user_states() if has_jobs else {}
+        active = [
+            plan
+            for plan in plans
+            if any(job_id in states for job_id in _plan_job_ids(plan))
+        ]
+        workflows = (
+            [_workflow(plan, states, load_scheduler=False) for plan in active]
+            if fast
+            else _workflows(active, load_submitted_dumps=False)
+        )
+    else:
+        workflows = _all_workflows(
+            root,
+            include_local=finished or comprehensive,
+            load_submitted_dumps=finished or comprehensive,
+        )
+    if finished or comprehensive:
         workflows.sort(
             key=lambda workflow: (
                 workflow.submission is None,
@@ -828,18 +980,24 @@ def _print_summary(root: Path, failed: bool, finished: bool) -> None:
         )
     for workflow in workflows:
         counts = workflow.counts
-        include = (
-            workflow.terminal
-            if finished
-            else (
-                workflow.terminal
-                and bool(counts["failed"] or counts["cancelled"])
-                if failed
-                else not workflow.terminal
+        if fast:
+            include = True
+        elif comprehensive:
+            include = (
+                all_after is None
+                or workflow.submission is None
+                or workflow.submission >= all_after
             )
-        )
+        elif finished:
+            include = workflow.terminal
+        elif failed:
+            include = workflow.terminal and bool(
+                counts["failed"] or counts["cancelled"]
+            )
+        else:
+            include = not workflow.terminal
         if include:
-            if finished:
+            if comprehensive:
                 rows.append((
                     workflow.plan.workflow,
                     workflow.plan.pipeline,
@@ -847,6 +1005,26 @@ def _print_summary(root: Path, failed: bool, finished: bool) -> None:
                     if workflow.submission is not None
                     else "-",
                     workflow.state,
+                    *(counts[category] for category in _CATEGORIES),
+                ))
+            elif finished:
+                rows.append((
+                    workflow.plan.workflow,
+                    workflow.plan.pipeline,
+                    workflow.submission.isoformat()
+                    if workflow.submission is not None
+                    else "-",
+                    workflow.state,
+                ))
+            elif fast:
+                total = len(workflow.jobs)
+                rows.append((
+                    workflow.plan.workflow,
+                    workflow.plan.pipeline,
+                    total,
+                    counts["pending"],
+                    counts["running"],
+                    total - counts["pending"] - counts["running"],
                 ))
             else:
                 rows.append((
@@ -856,11 +1034,23 @@ def _print_summary(root: Path, failed: bool, finished: bool) -> None:
                 ))
     if rows:
         columns = (
-            ("WORKFLOW", "PIPELINE", "SUBMISSION", "STATUS")
+            _ALL_SUMMARY_COLUMNS
+            if comprehensive
+            else ("WORKFLOW", "PIPELINE", "SUBMISSION", "STATUS")
             if finished
+            else _QUEUE_SUMMARY_COLUMNS
+            if fast
             else _SUMMARY_COLUMNS
         )
         print(_format_table(columns, rows))
+    elif comprehensive:
+        if all_after is None:
+            print("No klej workflows.")
+        else:
+            print(
+                "No klej workflows submitted at or after "
+                f"{all_after.isoformat()}."
+            )
     elif finished:
         print("No finished klej workflows.")
     elif failed:
@@ -869,7 +1059,9 @@ def _print_summary(root: Path, failed: bool, finished: bool) -> None:
         print("No active klej workflows.")
 
 
-def _print_detail(root: Path, workflow_id: str, show_physical: bool) -> None:
+def _print_detail(
+    root: Path, workflow_id: str, show_physical: bool, failed: bool
+) -> None:
     plan = _plan(root, workflow_id)
     if plan.backend != "slurm":
         raise ValueError(
@@ -884,7 +1076,9 @@ def _print_detail(root: Path, workflow_id: str, show_physical: bool) -> None:
         if plan.version == 2
         else list(plan.jobs)
     )
-    states, start_times, exit_codes = _slurm_details(job_ids)
+    states, start_times, exit_codes = _slurm_details(
+        job_ids, _plan_accounting_start(plan)
+    )
     workflow = _workflow(plan, states, start_times, exit_codes)
     counts = workflow.counts
     print(f"Workflow: {workflow_id}")
@@ -914,6 +1108,7 @@ def _print_detail(root: Path, workflow_id: str, show_physical: bool) -> None:
                 job.index,
             ),
         )
+        if not failed or job.state == "failed"
     ]
     print()
     print(
@@ -945,6 +1140,8 @@ def _print_detail(root: Path, workflow_id: str, show_physical: bool) -> None:
                 and job.slurm_id != winners[job.logical_id]
                 else job.state
             )
+            if failed and display_state != "failed":
+                continue
             physical_rows.append((
                 job.index,
                 job.identity,
@@ -977,17 +1174,22 @@ def _print_detail(root: Path, workflow_id: str, show_physical: bool) -> None:
 
 def print_status(
     root: Path,
-    workflow_id: str | None = None,
     failed: bool = False,
     finished: bool = False,
-    physical: bool = False,
+    fast: bool = False,
+    show_all: bool = False,
+    all_after: datetime | None = None,
 ) -> None:
-    if physical and workflow_id is None:
-        raise ValueError("--physical requires a workflow ID")
-    if workflow_id is None:
-        _print_summary(root, failed, finished)
-    else:
-        _print_detail(root, workflow_id, physical)
+    _print_summary(root, failed, finished, fast, show_all, all_after)
+
+
+def print_inspection(
+    root: Path,
+    workflow_id: str,
+    physical: bool = False,
+    failed: bool = False,
+) -> None:
+    _print_detail(root, workflow_id, physical, failed)
 
 
 def _confirm(message: str) -> bool:
@@ -1082,16 +1284,18 @@ def _select_job(workflow: _WorkflowStatus, selector: str) -> _JobStatus:
     return next(iter(matches.values()))
 
 
-def _log_workflow(plan: _Plan) -> _WorkflowStatus:
+def _log_workflow(
+    plan: _Plan, accounting_start: datetime | None
+) -> _WorkflowStatus:
     if plan.version != 2:
-        return _workflow(plan, _slurm_states(list(plan.jobs)))
+        return _workflow(plan, _slurm_states(list(plan.jobs), accounting_start))
     job_ids = [
         str(job["slurm_job_id"])
         for job in plan.physical_jobs
         if job.get("slurm_job_id")
     ]
-    states, starts, exits = _slurm_details(job_ids)
-    return _workflow(plan, states, starts, exits)
+    states, exits = _slurm_statuses(job_ids, accounting_start)
+    return _workflow(plan, states, exit_codes=exits)
 
 
 def _select_log_job(
@@ -1188,10 +1392,12 @@ def _initial_log(path: Path, tail: int | None) -> int:
         return stream.tell()
 
 
-def _refresh(job: _JobStatus) -> str:
+def _refresh(job: _JobStatus, accounting_start: datetime | None) -> str:
     if job.slurm_id is None:
         return _trace_category(job.trace) if job.trace else "unknown"
-    return _category(_slurm_states([job.slurm_id]).get(job.slurm_id))
+    return _category(
+        _slurm_states([job.slurm_id], accounting_start).get(job.slurm_id)
+    )
 
 
 def print_logs(
@@ -1206,7 +1412,8 @@ def print_logs(
         raise ValueError(
             f"Workflow {workflow_id!r} uses the local backend; logs are only supported for Slurm workflows"
         )
-    workflow = _log_workflow(plan)
+    accounting_start = _plan_accounting_start(plan)
+    workflow = _log_workflow(plan, accounting_start)
     job, stage, attempts = _select_log_job(workflow, selector)
     waited_for_winner = False
     while job is None:
@@ -1221,7 +1428,7 @@ def print_logs(
             )
             waited_for_winner = True
         time.sleep(_FOLLOW_INTERVAL)
-        workflow = _log_workflow(plan)
+        workflow = _log_workflow(plan, accounting_start)
         job, stage, attempts = _select_log_job(workflow, selector)
     waited = False
     try:
@@ -1230,7 +1437,7 @@ def print_logs(
                 trace = job.trace + ("" if job.trace.endswith("\n") else "\n")
                 _write(trace.encode(errors="replace"))
                 return
-            state = _refresh(job)
+            state = _refresh(job, accounting_start)
             if state not in {"pending", "running"}:
                 raise RuntimeError(
                     f"Job {job.index} has no Slurm log or stored submission trace"
@@ -1254,7 +1461,7 @@ def print_logs(
             while True:
                 while content := stream.read(64 * 1024):
                     _write(content)
-                if _refresh(job) in _TERMINAL:
+                if _refresh(job, accounting_start) in _TERMINAL:
                     while content := stream.read(64 * 1024):
                         _write(content)
                     return
